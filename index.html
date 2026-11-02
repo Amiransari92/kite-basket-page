@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
 <title>Kite basket</title>
 <style>
   :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#ddd; --btn:#387ed1; --err:#c0392b; }
@@ -25,10 +26,12 @@
 <button id="send" hidden>Open in Kite</button>
 
 <!--
-  What this page does, in full: read ?b=<id>, fetch that order list from our own small
-  AWS endpoint, and submit it as a hidden form POST to Kite's published basket endpoint.
-  You then confirm (or edit) the orders on Kite's own screen. Nothing is sent anywhere else.
-  The api_key is Kite Publisher's PUBLIC key; the secret is never used or stored here.
+  What this page does, in full: the whole order list is inside the link, after the "#"
+  (browsers never send that part to any server). The page decodes it, shows it, and submits it
+  as a hidden form POST to Kite's published basket endpoint. You then confirm (or edit) the
+  orders on Kite's own screen. Nothing is stored or sent anywhere else. The api_key in the link
+  is a Kite app's PUBLIC key; the secret is never used.
+  Older links of the form ?b=<id> still work (orders fetched from our AWS endpoint, if it exists).
 -->
 <script src="config.js"></script>
 <script>
@@ -39,11 +42,6 @@
   var KITE_BASKET_URL = 'https://kite.zerodha.com/connect/basket';
 
   function fail(msg) { statusEl.textContent = msg; statusEl.className = 'err'; }
-
-  var id = new URLSearchParams(location.search).get('b') || '';
-  if (!/^[A-Za-z0-9_-]{16,64}$/.test(id)) { return fail('Invalid or missing basket link.'); }
-  var base = (window.KITE_BASKET_CONFIG || {}).lambdaUrl || '';
-  if (!base) { return fail('Page is not configured yet (lambdaUrl missing).'); }
 
   function submitToKite(doc) {
     var form = document.createElement('form');
@@ -58,33 +56,78 @@
     form.submit();
   }
 
+  function show(doc) {
+    if (!doc || !doc.api_key || !Array.isArray(doc.orders) || !doc.orders.length || doc.orders.length > 10) {
+      throw new Error('Basket is empty or malformed.');
+    }
+    var tbody = table.querySelector('tbody');
+    doc.orders.forEach(function (o) {
+      var tr = document.createElement('tr');
+      [[o.transaction_type, o.transaction_type === 'BUY' ? 'buy' : 'sell'], [o.tradingsymbol, ''], [o.quantity, ''], [o.price, '']]
+        .forEach(function (cell) {
+          var td = document.createElement('td'); td.textContent = cell[0]; if (cell[1]) { td.className = cell[1]; }
+          tr.appendChild(td);
+        });
+      tbody.appendChild(tr);
+    });
+    table.hidden = false;
+    statusEl.textContent = doc.note || 'Review, then tap the button. You confirm on Kite next.';
+    btn.hidden = false;
+    btn.addEventListener('click', function () { submitToKite(doc); });
+    // Auto-send after a short pause; the button stays as a fallback (iOS webviews may block it).
+    setTimeout(function () { submitToKite(doc); }, 1500);
+  }
+
+  // ---- self-contained link: #d=<base64url JSON> ----
+  function decodeFragment(frag) {
+    var b64 = frag.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) { b64 += '='; }
+    var bytes = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+  function ordersFromPayload(p) {
+    if (!p || typeof p.k !== 'string' || !Array.isArray(p.o) || !/^[A-Za-z0-9]{1,8}$/.test(p.t || '')) {
+      throw new Error('Invalid basket link.');
+    }
+    if (!(p.x > 0) || Date.now() / 1000 > p.x) {
+      throw new Error('This basket link has expired (limit prices go stale). Generate a new one.');
+    }
+    return {
+      api_key: p.k,
+      note: 'Expires ' + new Date(p.x * 1000).toLocaleString() + '. Review, then confirm on Kite.',
+      orders: p.o.map(function (r) {
+        if (!/^[A-Z0-9&-]{1,20}$/.test(r[0]) || (r[1] !== 'B' && r[1] !== 'S') || !(r[2] > 0) || !(r[3] > 0)) {
+          throw new Error('Invalid order in link.');
+        }
+        return { variety: 'regular', exchange: 'NSE', tradingsymbol: r[0], transaction_type: r[1] === 'B' ? 'BUY' : 'SELL',
+                 order_type: 'LIMIT', quantity: r[2], product: 'CNC', price: r[3], validity: 'DAY', tag: p.t };
+      })
+    };
+  }
+
+  try {
+    var hash = location.hash || '';
+    var m = /^#d=([A-Za-z0-9_-]+)$/.exec(hash);
+    if (m) {
+      var doc = ordersFromPayload(decodeFragment(m[1]));
+      history.replaceState(null, '', location.pathname); // keep the key/orders out of the address bar history
+      show(doc);
+      return;
+    }
+  } catch (e) { return fail(e.message || 'Invalid basket link.'); }
+
+  // ---- legacy link: ?b=<id> (AWS lookup) ----
+  var id = new URLSearchParams(location.search).get('b') || '';
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(id)) { return fail('Invalid or missing basket link.'); }
+  var base = (window.KITE_BASKET_CONFIG || {}).lambdaUrl || '';
+  if (!base) { return fail('Legacy links are not configured.'); }
   fetch(base.replace(/\/$/, '') + '/?b=' + encodeURIComponent(id), { cache: 'no-store' })
     .then(function (r) {
       if (r.status === 404) { throw new Error('This basket link has expired or does not exist.'); }
       if (!r.ok) { throw new Error('Could not load the basket (HTTP ' + r.status + ').'); }
       return r.json();
     })
-    .then(function (doc) {
-      if (!doc || !doc.api_key || !Array.isArray(doc.orders) || !doc.orders.length) {
-        throw new Error('Basket is empty or malformed.');
-      }
-      var tbody = table.querySelector('tbody');
-      doc.orders.forEach(function (o) {
-        var tr = document.createElement('tr');
-        [[o.transaction_type, o.transaction_type === 'BUY' ? 'buy' : 'sell'], [o.tradingsymbol, ''], [o.quantity, ''], [o.price, '']]
-          .forEach(function (cell) {
-            var td = document.createElement('td'); td.textContent = cell[0]; if (cell[1]) { td.className = cell[1]; }
-            tr.appendChild(td);
-          });
-        tbody.appendChild(tr);
-      });
-      table.hidden = false;
-      statusEl.textContent = doc.note || 'Review, then tap the button. You confirm on Kite next.';
-      btn.hidden = false;
-      btn.addEventListener('click', function () { submitToKite(doc); });
-      // Auto-send after a short pause; the button stays as a fallback (iOS webviews may block it).
-      setTimeout(function () { submitToKite(doc); }, 1500);
-    })
+    .then(show)
     .catch(function (e) { fail(e.message); });
 })();
 </script>
